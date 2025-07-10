@@ -1,3 +1,4 @@
 flask
 python-dotenv
 python-binance
+gunicorn
