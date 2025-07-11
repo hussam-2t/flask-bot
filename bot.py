@@ -5,12 +5,12 @@ from dotenv import load_dotenv
 from binance.client import Client
 from binance.enums import *
 
-# تحميل المفاتيح من .env
+# تحميل المفاتيح من ملف .env
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 
-# تحقق من المفاتيح
+# تحقق من وجود المفاتيح
 if not API_KEY or not API_SECRET:
     raise Exception("API_KEY و API_SECRET غير موجودة في ملف .env")
 
@@ -22,51 +22,36 @@ app = Flask(__name__)
 
 # إعدادات البوت
 symbol = "BTCUSDT"
-leverage = 125  # تم التغيير لأقصى رافعة
+leverage = 125  # رفع الرافعة لأقصى حد
 risk_percent = 0.02
-sl_percent = 0.01
-tp_percent = 0.02
+atr_multiplier = 1.5
 
-# حساب الكمية بدقة وتفادي أخطاء الدقة والهامش
-def calculate_position_size(balance, price):
-    safe_balance = balance * 0.8  # استخدام 80% من الرصيد لضمان أمان الهامش
+# حساب حجم الصفقة بناءً على الرصيد
+def calculate_position_size(balance, price, sl_percent):
+    safe_balance = balance  # استخدام كامل الرصيد
     risk_amount = safe_balance * risk_percent
     sl_amount = price * sl_percent
-    qty = (risk_amount / sl_amount) * leverage
-    qty = round(qty, 3)  # BTCUSDT يقبل 3 أرقام عشرية فقط
-
-    if qty < 0.001:
-        print(f"❌ الكمية المحسوبة {qty} أقل من الحد الأدنى 0.001 BTC. لن يتم فتح الصفقة.")
-        return 0
+    qty = risk_amount / sl_amount
+    qty = max(round(qty, 3), 0.001)  # التأكد من ألا تقل الكمية عن 0.001 BTC
     return qty
 
-# تنفيذ الصفقة
+# تنفيذ صفقة
 def execute_trade(signal_type):
     try:
         balance_info = client.futures_account_balance()
-        if not balance_info:
-            print("❌ تعذر الحصول على الرصيد")
-            return
+        usdt_balance = next(item for item in balance_info if item['asset'] == 'USDT')
+        balance = float(usdt_balance['balance'])
 
-        usdt_balance = 0
-        for asset in balance_info:
-            if asset['asset'] == 'USDT':
-                usdt_balance = float(asset['balance'])
-                break
-
-        price_info = client.futures_symbol_ticker(symbol=symbol)
-        price = float(price_info["price"])
-
-        quantity = calculate_position_size(usdt_balance, price)
-        if quantity == 0:
-            return
+        price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
+        sl_percent = 0.01
+        tp_percent = 0.02
+        quantity = calculate_position_size(balance, price, sl_percent)
 
         client.futures_change_leverage(symbol=symbol, leverage=leverage)
 
         if signal_type == "buy":
             sl = round(price * (1 - sl_percent), 2)
             tp = round(price * (1 + tp_percent), 2)
-
             client.futures_create_order(
                 symbol=symbol,
                 side=SIDE_BUY,
@@ -88,12 +73,11 @@ def execute_trade(signal_type):
                 timeInForce=TIME_IN_FORCE_GTC,
                 closePosition=True
             )
-            print(f"✅ صفقة شراء: الكمية={quantity}, السعر={price}, TP={tp}, SL={sl}")
+            print(f"✅ تم تنفيذ صفقة شراء: الكمية={quantity}, السعر={price}, TP={tp}, SL={sl}")
 
         elif signal_type == "sell":
             sl = round(price * (1 + sl_percent), 2)
             tp = round(price * (1 - tp_percent), 2)
-
             client.futures_create_order(
                 symbol=symbol,
                 side=SIDE_SELL,
@@ -115,12 +99,12 @@ def execute_trade(signal_type):
                 timeInForce=TIME_IN_FORCE_GTC,
                 closePosition=True
             )
-            print(f"✅ صفقة بيع: الكمية={quantity}, السعر={price}, TP={tp}, SL={sl}")
+            print(f"✅ تم تنفيذ صفقة بيع: الكمية={quantity}, السعر={price}, TP={tp}, SL={sl}")
 
     except Exception as e:
         print(f"❌ خطأ أثناء تنفيذ الصفقة: {str(e)}")
 
-# استقبال الإشارات من TradingView
+# استقبال الإشارة من TradingView
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
