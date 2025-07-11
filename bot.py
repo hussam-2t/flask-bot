@@ -22,7 +22,7 @@ def calculate_position_size(balance, price):
     risk_amount = balance * risk_percent
     max_position_value = risk_amount * leverage
     qty = max_position_value / price
-    qty = round(qty, 5)  # لضمان عدم تجاوز الدقة المسموحة
+    qty = float(f"{qty:.3f}")  # تصحيح الدقة إلى 3 كسور فقط
     return qty
 
 def execute_trade(signal_type):
