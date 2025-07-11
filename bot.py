@@ -16,6 +16,7 @@ if not API_KEY or not API_SECRET:
 
 # إعداد Binance Client
 client = Client(API_KEY, API_SECRET)
+client.FUTURES_AUTO_TIMESTAMP = True
 
 # إعداد Flask
 app = Flask(__name__)
@@ -31,21 +32,28 @@ def calculate_position_size(balance, price, sl_percent):
     risk_amount = balance * risk_percent
     sl_amount = price * sl_percent
     qty = risk_amount / sl_amount
-    return round(qty, 3)
+    qty = round(qty, 3)
+
+    if qty < 0.001:
+        print(f"❌ الكمية المحسوبة {qty} أقل من الحد الأدنى 0.001 BTC. لن يتم فتح الصفقة.")
+        return 0
+    return qty
 
 # تنفيذ صفقة
 def execute_trade(signal_type):
     try:
         balance_info = client.futures_account_balance()
         if not balance_info:
-            print("تعذر الحصول على الرصيد")
+            print("❌ تعذر الحصول على الرصيد")
             return
 
         balance = float(balance_info[0]['balance'])
         price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
         sl_percent = 0.01
-        tp_percent = 0.015
+        tp_percent = 0.02
         quantity = calculate_position_size(balance, price, sl_percent)
+        if quantity == 0:
+            return
 
         client.futures_change_leverage(symbol=symbol, leverage=leverage)
 
@@ -56,8 +64,7 @@ def execute_trade(signal_type):
                 symbol=symbol,
                 side=SIDE_BUY,
                 type=ORDER_TYPE_MARKET,
-                quantity=quantity,
-                reduceOnly=False
+                quantity=quantity
             )
             client.futures_create_order(
                 symbol=symbol,
@@ -74,7 +81,7 @@ def execute_trade(signal_type):
                 timeInForce=TIME_IN_FORCE_GTC,
                 closePosition=True
             )
-            print(f"تم تنفيذ صفقة شراء: الكمية={quantity}, السعر={price}, TP={tp}, SL={sl}")
+            print(f"✅ صفقة شراء: الكمية={quantity}, السعر={price}, TP={tp}, SL={sl}")
 
         elif signal_type == "sell":
             sl = round(price * (1 + sl_percent), 2)
@@ -83,8 +90,7 @@ def execute_trade(signal_type):
                 symbol=symbol,
                 side=SIDE_SELL,
                 type=ORDER_TYPE_MARKET,
-                quantity=quantity,
-                reduceOnly=False
+                quantity=quantity
             )
             client.futures_create_order(
                 symbol=symbol,
@@ -101,36 +107,36 @@ def execute_trade(signal_type):
                 timeInForce=TIME_IN_FORCE_GTC,
                 closePosition=True
             )
-            print(f"تم تنفيذ صفقة بيع: الكمية={quantity}, السعر={price}, TP={tp}, SL={sl}")
+            print(f"✅ صفقة بيع: الكمية={quantity}, السعر={price}, TP={tp}, SL={sl}")
 
     except Exception as e:
-        print(f"خطأ أثناء تنفيذ الصفقة: {str(e)}")
+        print(f"❌ خطأ أثناء تنفيذ الصفقة: {str(e)}")
 
 # استقبال الإشارة من TradingView
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
         data = json.loads(request.data)
-        print(f"Received signal: {data}")
+        print(f"📥 Received signal: {data}")
 
         if data.get('passphrase') != "supersecretpass":
             return jsonify({"code": "error", "message": "Invalid passphrase"}), 403
 
         signal = data.get('signal')
         if signal == "buy":
-            print("Executing BUY order")
+            print("🚀 Executing BUY order")
             execute_trade("buy")
         elif signal == "sell":
-            print("Executing SELL order")
+            print("🔻 Executing SELL order")
             execute_trade("sell")
         else:
-            print("إشارة غير معروفة")
+            print("⚠️ إشارة غير معروفة")
             return jsonify({"code": "error", "message": "Unknown signal"}), 400
 
         return jsonify({"code": "success", "message": "Trade executed"}), 200
 
     except Exception as e:
-        print(f"خطأ أثناء المعالجة: {str(e)}")
+        print(f"❌ خطأ أثناء المعالجة: {str(e)}")
         return jsonify({"code": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
