@@ -5,53 +5,51 @@ from dotenv import load_dotenv
 from binance.client import Client
 from binance.enums import *
 
-# تحميل المفاتيح من ملف .env
+# تحميل المفاتيح من .env
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
-
-# تحقق من وجود المفاتيح
 if not API_KEY or not API_SECRET:
     raise Exception("API_KEY و API_SECRET غير موجودة في ملف .env")
 
 # إعداد Binance Client
 client = Client(API_KEY, API_SECRET)
+client.FUTURES_AUTO_TIMESTAMP = True
 
 # إعداد Flask
 app = Flask(__name__)
 
-# إعدادات البوت
+# إعدادات التداول
 symbol = "BTCUSDT"
 leverage = 5
-risk_percent = 0.02   # نسبة المخاطرة من رأس المال
-atr_multiplier = 1.5
+risk_percent = 0.02
+sl_percent = 0.01
+tp_percent = 0.02
 
-# حساب حجم الصفقة باستخدام الرصيد الكامل المتاح
-def calculate_position_size(balance, price, sl_percent):
-    risk_amount = balance * risk_percent         # المبلغ الذي ستخاطر به
-    sl_amount = price * sl_percent               # المسافة إلى وقف الخسارة
-    qty = (risk_amount * leverage) / sl_amount  # استخدام الرصيد بكامله بالرافعة
-    qty = round(qty, 4)  # دقة مناسبة
+# حساب الكمية مع ضبط الدقة
+def calculate_position_size(balance, price):
+    risk_amount = balance * risk_percent
+    sl_amount = price * sl_percent
+    qty = risk_amount / sl_amount
+    qty = qty * leverage
+    qty = round(qty, 3)  # BTCUSDT يقبل 3 أرقام عشرية فقط
+
     if qty < 0.001:
         print(f"❌ الكمية المحسوبة {qty} أقل من الحد الأدنى 0.001 BTC. لن يتم فتح الصفقة.")
         return 0
     return qty
 
-# تنفيذ صفقة
+# تنفيذ الصفقة
 def execute_trade(signal_type):
     try:
         balance_info = client.futures_account_balance()
-        usdt_balance = next((float(asset['balance']) for asset in balance_info if asset['asset'] == 'USDT'), 0)
-
+        usdt_balance = next((float(b['balance']) for b in balance_info if b['asset'] == 'USDT'), 0)
         if usdt_balance <= 0:
-            print("❌ الرصيد المتاح غير كافٍ.")
+            print("❌ لا يوجد رصيد كافٍ في حساب العقود الآجلة.")
             return
 
         price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
-        sl_percent = 0.01
-        tp_percent = 0.02
-        quantity = calculate_position_size(usdt_balance, price, sl_percent)
-
+        quantity = calculate_position_size(usdt_balance, price)
         if quantity == 0:
             return
 
@@ -60,59 +58,23 @@ def execute_trade(signal_type):
         if signal_type == "buy":
             sl = round(price * (1 - sl_percent), 2)
             tp = round(price * (1 + tp_percent), 2)
-            client.futures_create_order(
-                symbol=symbol,
-                side=SIDE_BUY,
-                type=ORDER_TYPE_MARKET,
-                quantity=quantity
-            )
-            client.futures_create_order(
-                symbol=symbol,
-                side=SIDE_SELL,
-                type=ORDER_TYPE_STOP_MARKET,
-                stopPrice=sl,
-                closePosition=True
-            )
-            client.futures_create_order(
-                symbol=symbol,
-                side=SIDE_SELL,
-                type=ORDER_TYPE_LIMIT,
-                price=tp,
-                timeInForce=TIME_IN_FORCE_GTC,
-                closePosition=True
-            )
+            client.futures_create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=quantity)
+            client.futures_create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_STOP_MARKET, stopPrice=sl, closePosition=True)
+            client.futures_create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_LIMIT, price=tp, timeInForce=TIME_IN_FORCE_GTC, closePosition=True)
             print(f"✅ تم تنفيذ صفقة شراء: الكمية={quantity}, السعر={price}, TP={tp}, SL={sl}")
 
         elif signal_type == "sell":
             sl = round(price * (1 + sl_percent), 2)
             tp = round(price * (1 - tp_percent), 2)
-            client.futures_create_order(
-                symbol=symbol,
-                side=SIDE_SELL,
-                type=ORDER_TYPE_MARKET,
-                quantity=quantity
-            )
-            client.futures_create_order(
-                symbol=symbol,
-                side=SIDE_BUY,
-                type=ORDER_TYPE_STOP_MARKET,
-                stopPrice=sl,
-                closePosition=True
-            )
-            client.futures_create_order(
-                symbol=symbol,
-                side=SIDE_BUY,
-                type=ORDER_TYPE_LIMIT,
-                price=tp,
-                timeInForce=TIME_IN_FORCE_GTC,
-                closePosition=True
-            )
+            client.futures_create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=quantity)
+            client.futures_create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_STOP_MARKET, stopPrice=sl, closePosition=True)
+            client.futures_create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_LIMIT, price=tp, timeInForce=TIME_IN_FORCE_GTC, closePosition=True)
             print(f"✅ تم تنفيذ صفقة بيع: الكمية={quantity}, السعر={price}, TP={tp}, SL={sl}")
 
     except Exception as e:
         print(f"❌ خطأ أثناء تنفيذ الصفقة: {str(e)}")
 
-# استقبال الإشارة من TradingView
+# استقبال webhook
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
