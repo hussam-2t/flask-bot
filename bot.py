@@ -26,13 +26,14 @@ leverage = 5
 risk_percent = 0.02
 atr_multiplier = 1.5
 
-# حساب حجم الصفقة بناءً على الرصيد مع تطبيق الرافعة
+# حساب حجم الصفقة بناءً على الرصيد
+
 def calculate_position_size(balance, price, sl_percent):
     risk_amount = balance * risk_percent
     sl_amount = price * sl_percent
     qty = risk_amount / sl_amount
-    qty = qty * leverage   # ✅ تطبيق الرافعة بشكل صحيح
-    qty = round(qty, 4)    # دقة أعلى
+    qty *= leverage  # ✅ ضرب الرافعة قبل الفحص
+    qty = round(qty, 4)
 
     if qty < 0.001:
         print(f"❌ الكمية المحسوبة {qty} أقل من الحد الأدنى 0.001 BTC. لن يتم فتح الصفقة.")
@@ -40,19 +41,18 @@ def calculate_position_size(balance, price, sl_percent):
     return qty
 
 # تنفيذ صفقة
+
 def execute_trade(signal_type):
     try:
         balance_info = client.futures_account_balance()
         if not balance_info:
-            print("❌ تعذر الحصول على الرصيد")
+            print("تعذر الحصول على الرصيد")
             return
 
         balance = float(balance_info[0]['balance'])
-        price_info = client.futures_symbol_ticker(symbol=symbol)
-        price = float(price_info["price"])
-
+        price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
         sl_percent = 0.01
-        tp_percent = 0.02  # ✅ الربح المستهدف 2%
+        tp_percent = 0.02
         quantity = calculate_position_size(balance, price, sl_percent)
 
         if quantity == 0:
@@ -63,7 +63,6 @@ def execute_trade(signal_type):
         if signal_type == "buy":
             sl = round(price * (1 - sl_percent), 2)
             tp = round(price * (1 + tp_percent), 2)
-
             client.futures_create_order(
                 symbol=symbol,
                 side=SIDE_BUY,
@@ -91,7 +90,6 @@ def execute_trade(signal_type):
         elif signal_type == "sell":
             sl = round(price * (1 + sl_percent), 2)
             tp = round(price * (1 - tp_percent), 2)
-
             client.futures_create_order(
                 symbol=symbol,
                 side=SIDE_SELL,
@@ -120,6 +118,7 @@ def execute_trade(signal_type):
         print(f"❌ خطأ أثناء تنفيذ الصفقة: {str(e)}")
 
 # استقبال الإشارة من TradingView
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
