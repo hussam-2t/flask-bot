@@ -23,37 +23,34 @@ app = Flask(__name__)
 # إعدادات البوت
 symbol = "BTCUSDT"
 leverage = 5
-risk_percent = 0.02
+risk_percent = 0.02   # نسبة المخاطرة من رأس المال
 atr_multiplier = 1.5
 
-# حساب حجم الصفقة بناءً على الرصيد
-
+# حساب حجم الصفقة باستخدام الرصيد الكامل المتاح
 def calculate_position_size(balance, price, sl_percent):
-    risk_amount = balance * risk_percent
-    sl_amount = price * sl_percent
-    qty = risk_amount / sl_amount
-    qty *= leverage  # ✅ ضرب الرافعة قبل الفحص
-    qty = round(qty, 4)
-
+    risk_amount = balance * risk_percent         # المبلغ الذي ستخاطر به
+    sl_amount = price * sl_percent               # المسافة إلى وقف الخسارة
+    qty = (risk_amount * leverage) / sl_amount  # استخدام الرصيد بكامله بالرافعة
+    qty = round(qty, 4)  # دقة مناسبة
     if qty < 0.001:
         print(f"❌ الكمية المحسوبة {qty} أقل من الحد الأدنى 0.001 BTC. لن يتم فتح الصفقة.")
         return 0
     return qty
 
 # تنفيذ صفقة
-
 def execute_trade(signal_type):
     try:
         balance_info = client.futures_account_balance()
-        if not balance_info:
-            print("تعذر الحصول على الرصيد")
+        usdt_balance = next((float(asset['balance']) for asset in balance_info if asset['asset'] == 'USDT'), 0)
+
+        if usdt_balance <= 0:
+            print("❌ الرصيد المتاح غير كافٍ.")
             return
 
-        balance = float(balance_info[0]['balance'])
         price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
         sl_percent = 0.01
         tp_percent = 0.02
-        quantity = calculate_position_size(balance, price, sl_percent)
+        quantity = calculate_position_size(usdt_balance, price, sl_percent)
 
         if quantity == 0:
             return
@@ -67,8 +64,7 @@ def execute_trade(signal_type):
                 symbol=symbol,
                 side=SIDE_BUY,
                 type=ORDER_TYPE_MARKET,
-                quantity=quantity,
-                reduceOnly=False
+                quantity=quantity
             )
             client.futures_create_order(
                 symbol=symbol,
@@ -94,8 +90,7 @@ def execute_trade(signal_type):
                 symbol=symbol,
                 side=SIDE_SELL,
                 type=ORDER_TYPE_MARKET,
-                quantity=quantity,
-                reduceOnly=False
+                quantity=quantity
             )
             client.futures_create_order(
                 symbol=symbol,
@@ -118,7 +113,6 @@ def execute_trade(signal_type):
         print(f"❌ خطأ أثناء تنفيذ الصفقة: {str(e)}")
 
 # استقبال الإشارة من TradingView
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
