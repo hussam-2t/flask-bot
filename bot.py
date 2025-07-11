@@ -14,10 +14,10 @@ client = Client(API_KEY, API_SECRET)
 app = Flask(__name__)
 
 symbol = "BTCUSDT"
-leverage = 125
+leverage = 5  # تعديل الرافعة إلى 5x
 risk_percent = 0.02
 
-# جلب الدقة المسموح بها من Binance تلقائيًا
+# جلب الدقة المسموح بها تلقائيا من Binance
 exchange_info = client.futures_exchange_info()
 step_size = 0.001  # افتراضي
 for s in exchange_info['symbols']:
