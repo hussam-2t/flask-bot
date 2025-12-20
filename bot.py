@@ -20,9 +20,7 @@ OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY")
 OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "")
 OKX_DEMO = os.getenv("OKX_DEMO", "1") == "1"
-
-# اختياري (لو حسابك cross/isolated)
-OKX_TD_MODE = os.getenv("OKX_TD_MODE", "cross")  # "cross" or "isolated"
+OKX_TD_MODE = os.getenv("OKX_TD_MODE", "cross")  # cross / isolated
 
 if not all([OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE]):
     raise RuntimeError("Missing OKX env vars. Check Render Environment Variables")
@@ -35,9 +33,7 @@ okx = ccxt.okx({
     "secret": OKX_SECRET_KEY,
     "password": OKX_PASSPHRASE,
     "enableRateLimit": True,
-    "options": {
-        "defaultType": "swap",  # perpetual futures
-    },
+    "options": {"defaultType": "swap"},
 })
 
 if OKX_DEMO:
@@ -79,7 +75,6 @@ def get_last_price() -> float:
 
 
 def set_leverage():
-    # في OKX قد يحتاج tdMode أحيانًا، لكن نجرب الافتراضي أولاً
     okx.set_leverage(leverage, symbol)
 
 
@@ -87,10 +82,32 @@ def calculate_position_size(balance_usdt: float, price: float) -> float:
     risk_amount = balance_usdt * risk_percent
     sl_amount_per_btc = price * sl_percent
     qty = risk_amount / sl_amount_per_btc
-
-    # ✅ الكمية حسب دقة OKX
-    qty = float(okx.amount_to_precision(symbol, qty))
+    qty = float(okx.amount_to_precision(symbol, qty))  # ✅ صحيح لـ OKX
     return qty
+
+
+def _place_tp_sl(close_side: str, qty: float, tp_price: float, sl_price: float, reduce_only: bool):
+    """
+    يحاول وضع TP limit + SL trigger market.
+    إذا reduce_only غير مدعوم في حسابك/الـ demo، سنعيد المحاولة بدونه.
+    """
+    base_params = {"tdMode": OKX_TD_MODE}
+
+    tp_params = dict(base_params)
+    sl_params = dict(base_params)
+
+    if reduce_only:
+        tp_params["reduceOnly"] = True
+        sl_params["reduceOnly"] = True
+
+    # TP Limit
+    tp = okx.create_order(symbol, "limit", close_side, qty, tp_price, tp_params)
+
+    # SL Trigger Market (✅) باستخدام triggerPrice
+    sl_params["triggerPrice"] = sl_price
+    sl = okx.create_order(symbol, "market", close_side, qty, None, sl_params)
+
+    return tp, sl
 
 
 def place_order(signal: str):
@@ -105,12 +122,11 @@ def place_order(signal: str):
 
     set_leverage()
 
-    # دخول
+    # دخول Market
     side = "buy" if signal == "buy" else "sell"
-    common_params = {"tdMode": OKX_TD_MODE}
-    entry = okx.create_order(symbol, "market", side, qty, None, common_params)
+    entry = okx.create_order(symbol, "market", side, qty, None, {"tdMode": OKX_TD_MODE})
 
-    # تحديد TP/SL
+    # حساب TP/SL
     if signal == "buy":
         sl_price = price * (1 - sl_percent)
         tp_price = price * (1 + tp_percent)
@@ -123,24 +139,25 @@ def place_order(signal: str):
     tp_price = float(okx.price_to_precision(symbol, tp_price))
     sl_price = float(okx.price_to_precision(symbol, sl_price))
 
-    # ===== Take Profit: Limit reduceOnly =====
-    tp_params = {"reduceOnly": True, "tdMode": OKX_TD_MODE}
-    tp = okx.create_order(symbol, "limit", close_side, qty, tp_price, tp_params)
-
-    # ===== Stop Loss: Trigger Market (✅ الحل الصحيح) =====
-    # بدلاً من type="stop" الذي يحتاج orderPx
-    sl_params = {
-        "reduceOnly": True,
-        "tdMode": OKX_TD_MODE,
-        "triggerPrice": sl_price,   # ✅ هذا هو المهم
-    }
-    sl = okx.create_order(symbol, "market", close_side, qty, None, sl_params)
+    # 1) جرب مع reduceOnly
+    try:
+        tp, sl = _place_tp_sl(close_side, qty, tp_price, sl_price, reduce_only=True)
+        reduce_only_used = True
+    except Exception as e:
+        msg = str(e)
+        # 51205 Reduce Only is not available -> أعد المحاولة بدون reduceOnly
+        if "51205" in msg or "Reduce Only is not available" in msg:
+            tp, sl = _place_tp_sl(close_side, qty, tp_price, sl_price, reduce_only=False)
+            reduce_only_used = False
+        else:
+            raise
 
     return {
         "qty": qty,
         "price": price,
         "sl_price": sl_price,
         "tp_price": tp_price,
+        "reduce_only_used": reduce_only_used,
         "entry": entry,
         "tp": tp,
         "sl": sl,
