@@ -8,7 +8,6 @@ import ccxt
 # =========================
 load_dotenv()
 
-# ===== ENV TEST (آمن 100%) =====
 print("ENV TEST")
 print("OKX_API_KEY:", bool(os.getenv("OKX_API_KEY")))
 print("OKX_SECRET_KEY:", bool(os.getenv("OKX_SECRET_KEY")))
@@ -22,6 +21,9 @@ OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "")
 OKX_DEMO = os.getenv("OKX_DEMO", "1") == "1"
 
+# اختياري (لو حسابك cross/isolated)
+OKX_TD_MODE = os.getenv("OKX_TD_MODE", "cross")  # "cross" or "isolated"
+
 if not all([OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE]):
     raise RuntimeError("Missing OKX env vars. Check Render Environment Variables")
 
@@ -31,18 +33,16 @@ if not all([OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE]):
 okx = ccxt.okx({
     "apiKey": OKX_API_KEY,
     "secret": OKX_SECRET_KEY,
-    "password": OKX_PASSPHRASE,  # OKX passphrase
+    "password": OKX_PASSPHRASE,
     "enableRateLimit": True,
     "options": {
-        "defaultType": "swap",   # perpetual futures
+        "defaultType": "swap",  # perpetual futures
     },
 })
 
-# Demo / Paper trading
 if OKX_DEMO:
     okx.set_sandbox_mode(True)
 
-# تحميل الأسواق مرة واحدة
 okx.load_markets()
 
 # =========================
@@ -65,7 +65,6 @@ tp_percent = 0.015
 # =========================
 def get_usdt_balance() -> float:
     bal = okx.fetch_balance()
-    # بعض الإصدارات ترجع bal['USDT']['free'] أو bal['free']['USDT']
     free = None
     if isinstance(bal.get("USDT"), dict):
         free = bal["USDT"].get("free")
@@ -80,7 +79,7 @@ def get_last_price() -> float:
 
 
 def set_leverage():
-    # قد يحتاج OKX params إضافية حسب وضع الحساب، لكن نجرب الافتراضي أولاً
+    # في OKX قد يحتاج tdMode أحيانًا، لكن نجرب الافتراضي أولاً
     okx.set_leverage(leverage, symbol)
 
 
@@ -89,9 +88,8 @@ def calculate_position_size(balance_usdt: float, price: float) -> float:
     sl_amount_per_btc = price * sl_percent
     qty = risk_amount / sl_amount_per_btc
 
-    # ✅ الطريقة الصحيحة مع ccxt لتطابق دقة الكمية في OKX
+    # ✅ الكمية حسب دقة OKX
     qty = float(okx.amount_to_precision(symbol, qty))
-
     return qty
 
 
@@ -102,18 +100,17 @@ def place_order(signal: str):
 
     price = get_last_price()
     qty = calculate_position_size(balance, price)
-
     if qty <= 0:
         raise RuntimeError("Calculated qty <= 0")
 
     set_leverage()
 
+    # دخول
     side = "buy" if signal == "buy" else "sell"
+    common_params = {"tdMode": OKX_TD_MODE}
+    entry = okx.create_order(symbol, "market", side, qty, None, common_params)
 
-    # دخول Market
-    entry = okx.create_order(symbol, "market", side, qty)
-
-    # TP / SL (قد يحتاج تعديل لاحق بصيغة Trigger الخاصة بـ OKX)
+    # تحديد TP/SL
     if signal == "buy":
         sl_price = price * (1 - sl_percent)
         tp_price = price * (1 + tp_percent)
@@ -123,31 +120,27 @@ def place_order(signal: str):
         tp_price = price * (1 - tp_percent)
         close_side = "buy"
 
-    # تقريب الأسعار وفق الدقة
     tp_price = float(okx.price_to_precision(symbol, tp_price))
     sl_price = float(okx.price_to_precision(symbol, sl_price))
 
-    params = {"reduceOnly": True}
+    # ===== Take Profit: Limit reduceOnly =====
+    tp_params = {"reduceOnly": True, "tdMode": OKX_TD_MODE}
+    tp = okx.create_order(symbol, "limit", close_side, qty, tp_price, tp_params)
 
-    # TP Limit
-    tp = okx.create_order(symbol, "limit", close_side, qty, tp_price, params)
-
-    # SL Stop (قد يختلف في OKX؛ إن ظهر خطأ سنحوّله لأمر Trigger OKX الصحيح)
-    sl = okx.create_order(
-        symbol,
-        "stop",
-        close_side,
-        qty,
-        None,
-        {
-            **params,
-            "stopPrice": sl_price,
-        },
-    )
+    # ===== Stop Loss: Trigger Market (✅ الحل الصحيح) =====
+    # بدلاً من type="stop" الذي يحتاج orderPx
+    sl_params = {
+        "reduceOnly": True,
+        "tdMode": OKX_TD_MODE,
+        "triggerPrice": sl_price,   # ✅ هذا هو المهم
+    }
+    sl = okx.create_order(symbol, "market", close_side, qty, None, sl_params)
 
     return {
         "qty": qty,
         "price": price,
+        "sl_price": sl_price,
+        "tp_price": tp_price,
         "entry": entry,
         "tp": tp,
         "sl": sl,
@@ -186,6 +179,5 @@ def webhook():
 
 
 if __name__ == "__main__":
-    # مهم لـ Render
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
