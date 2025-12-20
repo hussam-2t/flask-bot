@@ -1,5 +1,4 @@
 import os
-import math
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import ccxt
@@ -24,7 +23,7 @@ WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "")
 OKX_DEMO = os.getenv("OKX_DEMO", "1") == "1"
 
 if not all([OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE]):
-    raise RuntimeError("Missing OKX env vars. Check .env")
+    raise RuntimeError("Missing OKX env vars. Check Render Environment Variables")
 
 # =========================
 # OKX via CCXT
@@ -32,7 +31,7 @@ if not all([OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE]):
 okx = ccxt.okx({
     "apiKey": OKX_API_KEY,
     "secret": OKX_SECRET_KEY,
-    "password": OKX_PASSPHRASE,  # passphrase
+    "password": OKX_PASSPHRASE,  # OKX passphrase
     "enableRateLimit": True,
     "options": {
         "defaultType": "swap",   # perpetual futures
@@ -42,6 +41,9 @@ okx = ccxt.okx({
 # Demo / Paper trading
 if OKX_DEMO:
     okx.set_sandbox_mode(True)
+
+# تحميل الأسواق مرة واحدة
+okx.load_markets()
 
 # =========================
 # Flask
@@ -63,10 +65,13 @@ tp_percent = 0.015
 # =========================
 def get_usdt_balance() -> float:
     bal = okx.fetch_balance()
-    free = bal.get("USDT", {}).get("free")
-    if free is None:
-        free = bal.get("free", {}).get("USDT", 0)
-    return float(free or 0)
+    # بعض الإصدارات ترجع bal['USDT']['free'] أو bal['free']['USDT']
+    free = None
+    if isinstance(bal.get("USDT"), dict):
+        free = bal["USDT"].get("free")
+    if free is None and isinstance(bal.get("free"), dict):
+        free = bal["free"].get("USDT")
+    return float(free or 0.0)
 
 
 def get_last_price() -> float:
@@ -75,6 +80,7 @@ def get_last_price() -> float:
 
 
 def set_leverage():
+    # قد يحتاج OKX params إضافية حسب وضع الحساب، لكن نجرب الافتراضي أولاً
     okx.set_leverage(leverage, symbol)
 
 
@@ -83,16 +89,17 @@ def calculate_position_size(balance_usdt: float, price: float) -> float:
     sl_amount_per_btc = price * sl_percent
     qty = risk_amount / sl_amount_per_btc
 
-    market = okx.market(symbol)
-    precision = market.get("precision", {}).get("amount")
-    if precision is not None:
-        qty = float(f"{qty:.{precision}f}")
+    # ✅ الطريقة الصحيحة مع ccxt لتطابق دقة الكمية في OKX
+    qty = float(okx.amount_to_precision(symbol, qty))
 
     return qty
 
 
 def place_order(signal: str):
     balance = get_usdt_balance()
+    if balance <= 0:
+        raise RuntimeError("USDT balance is 0 (or not readable).")
+
     price = get_last_price()
     qty = calculate_position_size(balance, price)
 
@@ -106,7 +113,7 @@ def place_order(signal: str):
     # دخول Market
     entry = okx.create_order(symbol, "market", side, qty)
 
-    # TP / SL
+    # TP / SL (قد يحتاج تعديل لاحق بصيغة Trigger الخاصة بـ OKX)
     if signal == "buy":
         sl_price = price * (1 - sl_percent)
         tp_price = price * (1 + tp_percent)
@@ -116,10 +123,16 @@ def place_order(signal: str):
         tp_price = price * (1 - tp_percent)
         close_side = "buy"
 
+    # تقريب الأسعار وفق الدقة
+    tp_price = float(okx.price_to_precision(symbol, tp_price))
+    sl_price = float(okx.price_to_precision(symbol, sl_price))
+
     params = {"reduceOnly": True}
 
+    # TP Limit
     tp = okx.create_order(symbol, "limit", close_side, qty, tp_price, params)
 
+    # SL Stop (قد يختلف في OKX؛ إن ظهر خطأ سنحوّله لأمر Trigger OKX الصحيح)
     sl = okx.create_order(
         symbol,
         "stop",
@@ -166,10 +179,13 @@ def webhook():
         return jsonify({"success": True, "result": result}), 200
 
     except Exception as e:
+        import traceback
         print("ERROR:", e)
+        print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
+    # مهم لـ Render
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
