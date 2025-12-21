@@ -1,29 +1,51 @@
 import os
+import time
+import traceback
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import ccxt
 
 # =========================
-# Load ENV
+# Load .env
 # =========================
 load_dotenv()
 
+OKX_API_KEY = os.getenv("OKX_API_KEY", "").strip()
+OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY", "").strip()
+OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "").strip()
+
+WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "supersecretpass").strip()
+
+OKX_DEMO = os.getenv("OKX_DEMO", "1").strip() == "1"
+OKX_TD_MODE = os.getenv("OKX_TD_MODE", "isolated").strip().lower()  # isolated / cross
+OKX_LEVERAGE = int(os.getenv("OKX_LEVERAGE", "5").strip())
+
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.02").strip())
+SL_PERCENT = float(os.getenv("SL_PERCENT", "0.01").strip())
+TP_PERCENT = float(os.getenv("TP_PERCENT", "0.015").strip())
+
+SIGNAL_COOLDOWN_SEC = int(os.getenv("SIGNAL_COOLDOWN_SEC", "60").strip())
+
+# زوج التداول (تقدر تغيّره لاحقًا لأي عملة)
+OKX_SYMBOL = os.getenv("OKX_SYMBOL", "BTC/USDT:USDT").strip()
+
+# =========================
+# Quick ENV sanity (no secrets printed)
+# =========================
 print("ENV TEST")
-print("OKX_API_KEY:", bool(os.getenv("OKX_API_KEY")))
-print("OKX_SECRET_KEY:", bool(os.getenv("OKX_SECRET_KEY")))
-print("OKX_PASSPHRASE:", bool(os.getenv("OKX_PASSPHRASE")))
-print("OKX_DEMO:", os.getenv("OKX_DEMO"))
+print("OKX_API_KEY:", bool(OKX_API_KEY))
+print("OKX_SECRET_KEY:", bool(OKX_SECRET_KEY))
+print("OKX_PASSPHRASE:", bool(OKX_PASSPHRASE))
+print("OKX_DEMO:", "1" if OKX_DEMO else "0")
+print("OKX_TD_MODE:", OKX_TD_MODE)
+print("OKX_SYMBOL:", OKX_SYMBOL)
 print("------------------------")
 
-OKX_API_KEY = os.getenv("OKX_API_KEY")
-OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY")
-OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
-WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "")
-OKX_DEMO = os.getenv("OKX_DEMO", "1") == "1"
-OKX_TD_MODE = os.getenv("OKX_TD_MODE", "cross")  # cross / isolated
+if OKX_TD_MODE not in ("isolated", "cross"):
+    raise RuntimeError("OKX_TD_MODE must be 'isolated' or 'cross'")
 
-if not all([OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE]):
-    raise RuntimeError("Missing OKX env vars. Check Render Environment Variables")
+if not (OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE):
+    raise RuntimeError("Missing OKX env vars (OKX_API_KEY/OKX_SECRET_KEY/OKX_PASSPHRASE). Check .env or Render Env Vars.")
 
 # =========================
 # OKX via CCXT
@@ -33,7 +55,9 @@ okx = ccxt.okx({
     "secret": OKX_SECRET_KEY,
     "password": OKX_PASSPHRASE,
     "enableRateLimit": True,
-    "options": {"defaultType": "swap"},
+    "options": {
+        "defaultType": "swap",  # perpetual swaps
+    }
 })
 
 if OKX_DEMO:
@@ -47,120 +71,159 @@ okx.load_markets()
 app = Flask(__name__)
 
 # =========================
-# Bot Settings
+# Anti-duplicate (in-memory)
 # =========================
-symbol = "BTC/USDT:USDT"
-leverage = 5
-risk_percent = 0.02
-sl_percent = 0.01
-tp_percent = 0.015
+_last_signal = None
+_last_signal_ts = 0.0
 
 
-# =========================
-# Helpers
-# =========================
-def get_usdt_balance() -> float:
+def _now() -> float:
+    return time.time()
+
+
+def get_balance_usdt() -> float:
     bal = okx.fetch_balance()
     free = None
+
     if isinstance(bal.get("USDT"), dict):
         free = bal["USDT"].get("free")
+
     if free is None and isinstance(bal.get("free"), dict):
         free = bal["free"].get("USDT")
+
     return float(free or 0.0)
 
 
 def get_last_price() -> float:
-    ticker = okx.fetch_ticker(symbol)
-    return float(ticker["last"])
+    t = okx.fetch_ticker(OKX_SYMBOL)
+    return float(t["last"])
 
 
 def set_leverage():
-    okx.set_leverage(leverage, symbol)
+    """
+    OKX يحتاج محيانًا params إضافية.
+    نجرب أكثر من شكل لضمان العمل.
+    """
+    try:
+        okx.set_leverage(OKX_LEVERAGE, OKX_SYMBOL, params={"marginMode": OKX_TD_MODE})
+        return
+    except Exception:
+        pass
+
+    try:
+        okx.set_leverage(OKX_LEVERAGE, OKX_SYMBOL)
+        return
+    except Exception as e:
+        raise RuntimeError(f"Failed to set leverage: {e}")
 
 
-def calculate_position_size(balance_usdt: float, price: float) -> float:
-    risk_amount = balance_usdt * risk_percent
-    sl_amount_per_btc = price * sl_percent
-    qty = risk_amount / sl_amount_per_btc
-    qty = float(okx.amount_to_precision(symbol, qty))  # ✅ صحيح لـ OKX
+def calculate_qty(balance_usdt: float, price: float) -> float:
+    risk_amount = balance_usdt * RISK_PERCENT
+    sl_amount_per_1 = price * SL_PERCENT  # loss per 1 BTC (approx)
+    qty = risk_amount / sl_amount_per_1
+
+    qty = float(okx.amount_to_precision(OKX_SYMBOL, qty))
     return qty
 
 
-def _place_tp_sl(close_side: str, qty: float, tp_price: float, sl_price: float, reduce_only: bool):
+def has_open_position() -> bool:
     """
-    يحاول وضع TP limit + SL trigger market.
-    إذا reduce_only غير مدعوم في حسابك/الـ demo، سنعيد المحاولة بدونه.
+    يمنع فتح صفقة جديدة إذا يوجد Position مفتوح على نفس الزوج.
     """
-    base_params = {"tdMode": OKX_TD_MODE}
+    try:
+        positions = okx.fetch_positions([OKX_SYMBOL])
+    except Exception:
+        # إذا فشل، نحاول بدون فلتر
+        try:
+            positions = okx.fetch_positions()
+        except Exception:
+            return False
 
-    tp_params = dict(base_params)
-    sl_params = dict(base_params)
+    for p in positions:
+        if p.get("symbol") != OKX_SYMBOL:
+            continue
 
-    if reduce_only:
-        tp_params["reduceOnly"] = True
-        sl_params["reduceOnly"] = True
+        contracts = p.get("contracts")
+        if contracts is None:
+            contracts = p.get("info", {}).get("pos") or p.get("info", {}).get("position") or 0
 
-    # TP Limit
-    tp = okx.create_order(symbol, "limit", close_side, qty, tp_price, tp_params)
+        try:
+            c = float(contracts or 0.0)
+        except Exception:
+            c = 0.0
 
-    # SL Trigger Market (✅) باستخدام triggerPrice
-    sl_params["triggerPrice"] = sl_price
-    sl = okx.create_order(symbol, "market", close_side, qty, None, sl_params)
+        if abs(c) > 0:
+            return True
 
-    return tp, sl
+    return False
 
 
-def place_order(signal: str):
-    balance = get_usdt_balance()
+def place_market_with_attached_tpsl(signal: str) -> dict:
+    """
+    يفتح Market + يرفق TP/SL في نفس أمر الدخول
+    وهذا يجعل TP/SL "ظاهرة" في واجهة OKX غالبًا.
+    """
+    # 1) لا تفتح إذا توجد صفقة مفتوحة
+    if has_open_position():
+        return {
+            "skipped": True,
+            "reason": "Position already open. No new trades."
+        }
+
+    balance = get_balance_usdt()
     if balance <= 0:
         raise RuntimeError("USDT balance is 0 (or not readable).")
 
     price = get_last_price()
-    qty = calculate_position_size(balance, price)
+    qty = calculate_qty(balance, price)
     if qty <= 0:
-        raise RuntimeError("Calculated qty <= 0")
+        raise RuntimeError("Calculated qty <= 0 (check risk/SL settings).")
 
     set_leverage()
 
-    # دخول Market
     side = "buy" if signal == "buy" else "sell"
-    entry = okx.create_order(symbol, "market", side, qty, None, {"tdMode": OKX_TD_MODE})
 
-    # حساب TP/SL
+    # حساب TP/SL كقيم Trigger
     if signal == "buy":
-        sl_price = price * (1 - sl_percent)
-        tp_price = price * (1 + tp_percent)
-        close_side = "sell"
+        sl_trigger = price * (1 - SL_PERCENT)
+        tp_trigger = price * (1 + TP_PERCENT)
     else:
-        sl_price = price * (1 + sl_percent)
-        tp_price = price * (1 - tp_percent)
-        close_side = "buy"
+        sl_trigger = price * (1 + SL_PERCENT)
+        tp_trigger = price * (1 - TP_PERCENT)
 
-    tp_price = float(okx.price_to_precision(symbol, tp_price))
-    sl_price = float(okx.price_to_precision(symbol, sl_price))
+    tp_trigger = float(okx.price_to_precision(OKX_SYMBOL, tp_trigger))
+    sl_trigger = float(okx.price_to_precision(OKX_SYMBOL, sl_trigger))
 
-    # 1) جرب مع reduceOnly
-    try:
-        tp, sl = _place_tp_sl(close_side, qty, tp_price, sl_price, reduce_only=True)
-        reduce_only_used = True
-    except Exception as e:
-        msg = str(e)
-        # 51205 Reduce Only is not available -> أعد المحاولة بدون reduceOnly
-        if "51205" in msg or "Reduce Only is not available" in msg:
-            tp, sl = _place_tp_sl(close_side, qty, tp_price, sl_price, reduce_only=False)
-            reduce_only_used = False
-        else:
-            raise
+    # ✅ Attached TP/SL:
+    # - tpTriggerPx/slTriggerPx: سعر التفعيل
+    # - tpOrdPx/slOrdPx: سعر التنفيذ عند التفعيل
+    #   في OKX يمكن استخدام "-1" كـ "Market" عند التفعيل (شائع)
+    params = {
+        "tdMode": OKX_TD_MODE,
+        "tpTriggerPx": tp_trigger,
+        "tpOrdPx": "-1",
+        "slTriggerPx": sl_trigger,
+        "slOrdPx": "-1",
+    }
+
+    entry = okx.create_order(
+        OKX_SYMBOL,
+        "market",
+        side,
+        qty,
+        None,
+        params
+    )
 
     return {
+        "skipped": False,
+        "symbol": OKX_SYMBOL,
+        "side": side,
         "qty": qty,
-        "price": price,
-        "sl_price": sl_price,
-        "tp_price": tp_price,
-        "reduce_only_used": reduce_only_used,
-        "entry": entry,
-        "tp": tp,
-        "sl": sl,
+        "entry_price_ref": price,
+        "tp_trigger": tp_trigger,
+        "sl_trigger": sl_trigger,
+        "entry": entry
     }
 
 
@@ -169,32 +232,50 @@ def place_order(signal: str):
 # =========================
 @app.route("/", methods=["GET"])
 def home():
-    return "OKX Demo Bot (ccxt) is running", 200
+    return "OKX Bot running ✅", 200
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    global _last_signal, _last_signal_ts
+
     try:
         data = request.get_json(force=True)
-        print("WEBHOOK DATA:", data)
 
+        # passphrase check
         if WEBHOOK_PASSPHRASE and data.get("passphrase") != WEBHOOK_PASSPHRASE:
             return jsonify({"error": "Invalid passphrase"}), 403
 
-        signal = data.get("signal")
+        signal = (data.get("signal") or "").strip().lower()
         if signal not in ("buy", "sell"):
             return jsonify({"error": "signal must be buy or sell"}), 400
 
-        result = place_order(signal)
+        # 2) منع تكرار نفس الإشارة خلال cooldown
+        ts = _now()
+        if _last_signal == signal and (ts - _last_signal_ts) < SIGNAL_COOLDOWN_SEC:
+            return jsonify({
+                "success": True,
+                "skipped": True,
+                "reason": f"Duplicate signal blocked (cooldown {SIGNAL_COOLDOWN_SEC}s)",
+                "signal": signal
+            }), 200
+
+        # حدّث ذاكرة آخر إشارة
+        _last_signal = signal
+        _last_signal_ts = ts
+
+        # 3) تنفيذ الصفقة (مع TP/SL ظاهرة) + منع صفقة لو فيه Position
+        result = place_market_with_attached_tpsl(signal)
+
         return jsonify({"success": True, "result": result}), 200
 
     except Exception as e:
-        import traceback
         print("ERROR:", e)
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
+    # Render يستخدم PORT تلقائيًا
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
