@@ -26,7 +26,12 @@ TP_PERCENT = float(os.getenv("TP_PERCENT", "0.015").strip())
 
 SIGNAL_COOLDOWN_SEC = int(os.getenv("SIGNAL_COOLDOWN_SEC", "60").strip())
 
+# Default: BTC perp
 OKX_SYMBOL = os.getenv("OKX_SYMBOL", "BTC/USDT:USDT").strip()
+
+# New: use full balance
+USE_FULL_BALANCE = os.getenv("USE_FULL_BALANCE", "0").strip() == "1"
+BALANCE_UTILIZATION = float(os.getenv("BALANCE_UTILIZATION", "1.00").strip())  # 1.00 = 100%
 
 # =========================
 # ENV sanity (no secrets)
@@ -38,6 +43,8 @@ print("OKX_PASSPHRASE:", bool(OKX_PASSPHRASE))
 print("OKX_DEMO:", "1" if OKX_DEMO else "0")
 print("OKX_TD_MODE:", OKX_TD_MODE)
 print("OKX_SYMBOL:", OKX_SYMBOL)
+print("USE_FULL_BALANCE:", USE_FULL_BALANCE)
+print("BALANCE_UTILIZATION:", BALANCE_UTILIZATION)
 print("------------------------")
 
 if OKX_TD_MODE not in ("isolated", "cross"):
@@ -54,7 +61,9 @@ okx = ccxt.okx({
     "secret": OKX_SECRET_KEY,
     "password": OKX_PASSPHRASE,
     "enableRateLimit": True,
-    "options": {"defaultType": "swap"},
+    "options": {
+        "defaultType": "swap",
+    }
 })
 
 if OKX_DEMO:
@@ -67,6 +76,9 @@ okx.load_markets()
 # =========================
 app = Flask(__name__)
 
+# =========================
+# Anti-duplicate & anti-parallel
+# =========================
 _last_signal = None
 _last_signal_ts = 0.0
 _inflight = False
@@ -97,53 +109,91 @@ def set_leverage():
         return
     except Exception:
         pass
-    okx.set_leverage(OKX_LEVERAGE, OKX_SYMBOL)
+    try:
+        okx.set_leverage(OKX_LEVERAGE, OKX_SYMBOL)
+        return
+    except Exception as e:
+        raise RuntimeError(f"Failed to set leverage: {e}")
 
 
 def calculate_qty(balance_usdt: float, price: float) -> float:
-    # Risk model: risk_amount / (price*SL%)
+    """
+    إذا USE_FULL_BALANCE=1:
+      ندخل بكل الرصيد (100%) كـ Notional = balance * leverage * utilization
+      qty = notional / price
+    غير ذلك:
+      نستخدم نموذج المخاطرة الحالي (RISK_PERCENT/SL_PERCENT)
+    """
+    if USE_FULL_BALANCE:
+        notional = balance_usdt * OKX_LEVERAGE * BALANCE_UTILIZATION
+        qty = notional / price
+        return float(okx.amount_to_precision(OKX_SYMBOL, qty))
+
     risk_amount = balance_usdt * RISK_PERCENT
     sl_amount_per_1 = price * SL_PERCENT
     qty = risk_amount / sl_amount_per_1
-    qty = float(okx.amount_to_precision(OKX_SYMBOL, qty))
-    return qty
+    return float(okx.amount_to_precision(OKX_SYMBOL, qty))
 
 
 def has_open_position() -> bool:
     try:
         positions = okx.fetch_positions([OKX_SYMBOL])
     except Exception:
-        positions = okx.fetch_positions()
+        try:
+            positions = okx.fetch_positions()
+        except Exception:
+            return False
 
     for p in positions:
         if p.get("symbol") != OKX_SYMBOL:
             continue
+
         contracts = p.get("contracts")
         if contracts is None:
             contracts = p.get("info", {}).get("pos") or 0
+
         try:
             c = float(contracts or 0.0)
         except Exception:
             c = 0.0
+
         if abs(c) > 0:
             return True
     return False
 
 
-def market_id() -> str:
-    return okx.market(OKX_SYMBOL)["id"]  # مثال: BTC-USDT-SWAP
+def _market_id() -> str:
+    m = okx.market(OKX_SYMBOL)
+    return m["id"]
 
 
 def place_entry_market(signal: str, qty: float) -> dict:
     side = "buy" if signal == "buy" else "sell"
     params = {"tdMode": OKX_TD_MODE}
-    return okx.create_order(OKX_SYMBOL, "market", side, qty, None, params)
+    entry = okx.create_order(
+        OKX_SYMBOL,
+        "market",
+        side,
+        qty,
+        None,
+        params
+    )
+    return entry
 
 
-def place_algo_sl(signal: str, qty: float, trigger_price: float) -> dict:
-    inst_id = market_id()
+def place_tpsl_algo(signal: str, qty: float, entry_ref_price: float) -> dict:
+    inst_id = _market_id()
     close_side = "sell" if signal == "buy" else "buy"
-    trigger_price = float(okx.price_to_precision(OKX_SYMBOL, trigger_price))
+
+    if signal == "buy":
+        sl_trigger = entry_ref_price * (1 - SL_PERCENT)
+        tp_trigger = entry_ref_price * (1 + TP_PERCENT)
+    else:
+        sl_trigger = entry_ref_price * (1 + SL_PERCENT)
+        tp_trigger = entry_ref_price * (1 - TP_PERCENT)
+
+    tp_trigger = float(okx.price_to_precision(OKX_SYMBOL, tp_trigger))
+    sl_trigger = float(okx.price_to_precision(OKX_SYMBOL, sl_trigger))
 
     payload = {
         "instId": inst_id,
@@ -151,27 +201,14 @@ def place_algo_sl(signal: str, qty: float, trigger_price: float) -> dict:
         "side": close_side,
         "ordType": "conditional",
         "sz": str(qty),
-        "slTriggerPx": str(trigger_price),
-        "slOrdPx": "-1",  # market on trigger
+        "tpTriggerPx": str(tp_trigger),
+        "tpOrdPx": "-1",
+        "slTriggerPx": str(sl_trigger),
+        "slOrdPx": "-1",
     }
-    return okx.privatePostTradeOrderAlgo(payload)
 
-
-def place_algo_tp(signal: str, qty: float, trigger_price: float) -> dict:
-    inst_id = market_id()
-    close_side = "sell" if signal == "buy" else "buy"
-    trigger_price = float(okx.price_to_precision(OKX_SYMBOL, trigger_price))
-
-    payload = {
-        "instId": inst_id,
-        "tdMode": OKX_TD_MODE,
-        "side": close_side,
-        "ordType": "conditional",
-        "sz": str(qty),
-        "tpTriggerPx": str(trigger_price),
-        "tpOrdPx": "-1",  # market on trigger
-    }
-    return okx.privatePostTradeOrderAlgo(payload)
+    algo_resp = okx.privatePostTradeOrderAlgo(payload)
+    return {"algo": algo_resp, "tp_trigger": tp_trigger, "sl_trigger": sl_trigger}
 
 
 def execute_trade(signal: str) -> dict:
@@ -185,37 +222,25 @@ def execute_trade(signal: str) -> dict:
     price = get_last_price()
     qty = calculate_qty(balance, price)
     if qty <= 0:
-        raise RuntimeError("Calculated qty <= 0 (check RISK_PERCENT/SL_PERCENT).")
+        raise RuntimeError("Calculated qty <= 0 (check settings).")
 
     set_leverage()
 
     entry = place_entry_market(signal, qty)
 
-    # نأخذ سعر بعد الدخول (أقرب لسعر الدخول الحقيقي)
-    time.sleep(0.8)
+    # reference price after entry
     ref_price = get_last_price()
 
-    if signal == "buy":
-        sl = ref_price * (1 - SL_PERCENT)
-        tp = ref_price * (1 + TP_PERCENT)
-    else:
-        sl = ref_price * (1 + SL_PERCENT)
-        tp = ref_price * (1 - TP_PERCENT)
-
-    # ✅ أهم فرق: نرسل TP و SL كأمرين منفصلين (كلاهما سيظهر في OKX)
-    sl_resp = place_algo_sl(signal, qty, sl)
-    tp_resp = place_algo_tp(signal, qty, tp)
+    algo = place_tpsl_algo(signal, qty, ref_price)
 
     return {
         "symbol": OKX_SYMBOL,
         "signal": signal,
         "qty": qty,
         "entry": entry,
-        "ref_price": float(okx.price_to_precision(OKX_SYMBOL, ref_price)),
-        "sl": float(okx.price_to_precision(OKX_SYMBOL, sl)),
-        "tp": float(okx.price_to_precision(OKX_SYMBOL, tp)),
-        "sl_algo": sl_resp,
-        "tp_algo": tp_resp,
+        "tp": algo.get("tp_trigger"),
+        "sl": algo.get("sl_trigger"),
+        "algo": algo.get("algo"),
         "skipped": False
     }
 
