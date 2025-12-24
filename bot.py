@@ -105,14 +105,12 @@ def _fetch_balance_swap() -> dict:
     try:
         return okx.fetch_balance({"type": "swap"})
     except Exception:
-        # fallback
         return okx.fetch_balance()
 
 
 def get_balance_usdt() -> float:
     bal = _fetch_balance_swap()
 
-    # Try common CCXT structures
     free = None
     if isinstance(bal.get("USDT"), dict):
         free = bal["USDT"].get("free")
@@ -128,7 +126,6 @@ def get_last_price() -> float:
 
 
 def set_leverage():
-    # Try the common OKX variants
     try:
         okx.set_leverage(OKX_LEVERAGE, OKX_SYMBOL, params={"marginMode": OKX_TD_MODE})
         return
@@ -142,9 +139,6 @@ def set_leverage():
 
 
 def base_to_contracts(base_qty: float) -> float:
-    """
-    Convert base amount (BTC) -> contracts using market contractSize.
-    """
     contracts = base_qty / CONTRACT_SIZE
     contracts = float(okx.amount_to_precision(OKX_SYMBOL, contracts))
     return contracts
@@ -155,20 +149,12 @@ def contracts_to_base(contracts: float) -> float:
 
 
 def calculate_qty_contracts(balance_usdt: float, price: float) -> float:
-    """
-    Returns qty in contracts (not base BTC), because OKX swap uses contracts.
-    Two modes:
-      - Full balance mode: use (balance * utilization * leverage) as notional
-      - Risk mode: use RISK_PERCENT and SL_PERCENT
-    """
     if USE_FULL_BALANCE:
         usable_margin = balance_usdt * BALANCE_UTILIZATION
-        # Max notional approx = margin * leverage
         max_notional = usable_margin * OKX_LEVERAGE
-        base_qty = max_notional / price  # base BTC amount
+        base_qty = max_notional / price
         return base_to_contracts(base_qty)
 
-    # Risk-based (old way)
     risk_amount = balance_usdt * RISK_PERCENT
     sl_amount_per_1_base = price * SL_PERCENT
     base_qty = risk_amount / sl_amount_per_1_base
@@ -176,9 +162,6 @@ def calculate_qty_contracts(balance_usdt: float, price: float) -> float:
 
 
 def has_open_position() -> bool:
-    """
-    Prevent opening a new trade if there is an open position on OKX_SYMBOL.
-    """
     try:
         positions = okx.fetch_positions([OKX_SYMBOL])
     except Exception:
@@ -191,10 +174,7 @@ def has_open_position() -> bool:
         if p.get("symbol") != OKX_SYMBOL:
             continue
 
-        # CCXT unified
         contracts = p.get("contracts")
-
-        # OKX raw info fallback
         if contracts is None:
             contracts = p.get("info", {}).get("pos") or p.get("info", {}).get("availPos") or 0
 
@@ -209,32 +189,18 @@ def has_open_position() -> bool:
 
 
 def _market_id() -> str:
-    # CCXT market id for OKX, e.g. "BTC-USDT-SWAP"
     m = okx.market(OKX_SYMBOL)
     return m["id"]
 
 
 def place_entry_market(signal: str, qty_contracts: float) -> dict:
     side = "buy" if signal == "buy" else "sell"
-    params = {
-        "tdMode": OKX_TD_MODE,
-    }
-    entry = okx.create_order(
-        OKX_SYMBOL,
-        "market",
-        side,
-        qty_contracts,
-        None,
-        params
-    )
+    params = {"tdMode": OKX_TD_MODE}
+    entry = okx.create_order(OKX_SYMBOL, "market", side, qty_contracts, None, params)
     return entry
 
 
-def _extract_entry_price_from_order(order: dict) -> float | None:
-    """
-    Try to get a real entry avg price from ccxt order response.
-    """
-    # CCXT often includes: average, price, info.avgPx
+def _extract_entry_price_from_order(order: dict):
     avg = order.get("average")
     if avg:
         try:
@@ -256,25 +222,20 @@ def _extract_entry_price_from_order(order: dict) -> float | None:
                 return float(info.get(k))
             except Exception:
                 pass
-
     return None
 
 
 def place_tpsl_algo(signal: str, qty_contracts: float, entry_ref_price: float) -> dict:
     """
-    Create OKX algo order for TP/SL so it shows clearly in OKX.
-    Uses OKX endpoint via ccxt: privatePostTradeOrderAlgo
-
-    Notes:
-    - sz should be in contracts for swap
-    - tpOrdPx/slOrdPx = -1 => market on trigger
+    ✅ حل جذري: نستخدم OCO Algo (TP+SL معًا)
+    - هذا النوع في OKX مصمم ليضع TP و SL في نفس الوقت.
+    - إذا OKX رفض صيغة معينة (posSide) نحاول بدونها تلقائيًا.
     """
+
     inst_id = _market_id()
-
-    # If entry was buy (long), close side is sell; if entry was sell (short), close side is buy.
     close_side = "sell" if signal == "buy" else "buy"
+    pos_side = "long" if signal == "buy" else "short"
 
-    # tp/sl trigger prices
     if signal == "buy":
         sl_trigger = entry_ref_price * (1 - SL_PERCENT)
         tp_trigger = entry_ref_price * (1 + TP_PERCENT)
@@ -285,36 +246,72 @@ def place_tpsl_algo(signal: str, qty_contracts: float, entry_ref_price: float) -
     tp_trigger = okx.price_to_precision(OKX_SYMBOL, tp_trigger)
     sl_trigger = okx.price_to_precision(OKX_SYMBOL, sl_trigger)
 
-    payload = {
+    # --- (A) OCO with posSide (أفضل لما يكون الحساب Hedge/Long-Short)
+    payload_oco_with_pos = {
+        "instId": inst_id,
+        "tdMode": OKX_TD_MODE,
+        "side": close_side,
+        "posSide": pos_side,      # قد يُرفض في وضع net
+        "ordType": "oco",
+        "sz": str(qty_contracts),
+        "tpTriggerPx": str(tp_trigger),
+        "tpOrdPx": "-1",
+        "slTriggerPx": str(sl_trigger),
+        "slOrdPx": "-1",
+    }
+
+    # --- (B) OCO بدون posSide (لو حسابك One-way/Net)
+    payload_oco_no_pos = {
+        "instId": inst_id,
+        "tdMode": OKX_TD_MODE,
+        "side": close_side,
+        "ordType": "oco",
+        "sz": str(qty_contracts),
+        "tpTriggerPx": str(tp_trigger),
+        "tpOrdPx": "-1",
+        "slTriggerPx": str(sl_trigger),
+        "slOrdPx": "-1",
+    }
+
+    last_err = None
+
+    # Try OCO with posSide
+    try:
+        algo_resp = okx.privatePostTradeOrderAlgo(payload_oco_with_pos)
+        return {"algo": algo_resp, "tp_trigger": float(tp_trigger), "sl_trigger": float(sl_trigger), "mode": "OCO_with_posSide"}
+    except Exception as e:
+        last_err = e
+
+    # Try OCO without posSide
+    try:
+        algo_resp = okx.privatePostTradeOrderAlgo(payload_oco_no_pos)
+        return {"algo": algo_resp, "tp_trigger": float(tp_trigger), "sl_trigger": float(sl_trigger), "mode": "OCO_no_posSide"}
+    except Exception as e:
+        last_err = e
+
+    # Fallback (نادر): conditional كما كان سابقًا
+    payload_cond = {
         "instId": inst_id,
         "tdMode": OKX_TD_MODE,
         "side": close_side,
         "ordType": "conditional",
         "sz": str(qty_contracts),
-
-        # TP
         "tpTriggerPx": str(tp_trigger),
         "tpOrdPx": "-1",
-
-        # SL
         "slTriggerPx": str(sl_trigger),
         "slOrdPx": "-1",
     }
-
-    algo_resp = okx.privatePostTradeOrderAlgo(payload)
-    return {
-        "algo": algo_resp,
-        "tp_trigger": float(tp_trigger),
-        "sl_trigger": float(sl_trigger)
-    }
+    try:
+        algo_resp = okx.privatePostTradeOrderAlgo(payload_cond)
+        return {"algo": algo_resp, "tp_trigger": float(tp_trigger), "sl_trigger": float(sl_trigger), "mode": "CONDITIONAL_fallback"}
+    except Exception as e:
+        raise RuntimeError(f"Failed to create TP/SL algo (OCO/conditional). Last error: {last_err} / {e}")
 
 
 def execute_trade(signal: str) -> dict:
-    # 1) Do not trade if position open
     if has_open_position():
         return {"skipped": True, "reason": "Position already open. No new trade."}
 
-    # 2) Balance
     balance = get_balance_usdt()
     if balance <= 0:
         raise RuntimeError(
@@ -322,23 +319,18 @@ def execute_trade(signal: str) -> dict:
             "تأكد ان USDT موجود في حساب العقود (Swap/Futures) وليس Spot/Funding."
         )
 
-    # 3) Price + Qty
     price = get_last_price()
     qty_contracts = calculate_qty_contracts(balance, price)
     if qty_contracts <= 0:
         raise RuntimeError("Calculated qty <= 0 (check env vars).")
 
-    # 4) Leverage
     set_leverage()
 
-    # 5) Entry
     entry = place_entry_market(signal, qty_contracts)
 
-    # 6) Better entry reference price (avg fill if possible)
     entry_px = _extract_entry_price_from_order(entry)
     ref_price = entry_px if entry_px else get_last_price()
 
-    # 7) TP/SL Algo
     algo = place_tpsl_algo(signal, qty_contracts, ref_price)
 
     return {
@@ -351,6 +343,7 @@ def execute_trade(signal: str) -> dict:
         "entry_price_ref": ref_price,
         "tp": algo.get("tp_trigger"),
         "sl": algo.get("sl_trigger"),
+        "tpsl_mode": algo.get("mode"),
         "entry": entry,
         "algo": algo.get("algo"),
         "skipped": False
@@ -364,7 +357,6 @@ def home():
 
 @app.route("/status", methods=["GET"])
 def status():
-    # Useful quick check on Render
     try:
         bal = get_balance_usdt()
         px = get_last_price()
@@ -399,7 +391,6 @@ def webhook():
                 "received_raw": raw[:200]
             }), 400
 
-        # passphrase
         if WEBHOOK_PASSPHRASE and data.get("passphrase") != WEBHOOK_PASSPHRASE:
             return jsonify({"error": "Invalid passphrase"}), 403
 
@@ -407,11 +398,9 @@ def webhook():
         if signal not in ("buy", "sell"):
             return jsonify({"error": "signal must be buy or sell"}), 400
 
-        # prevent parallel execution (two webhooks at same second)
         if _inflight:
             return jsonify({"success": True, "skipped": True, "reason": "Busy (inflight). Try again."}), 200
 
-        # cooldown same signal
         ts = _now()
         if _last_signal == signal and (ts - _last_signal_ts) < SIGNAL_COOLDOWN_SEC:
             return jsonify({
@@ -435,7 +424,6 @@ def webhook():
         print("ERROR:", e)
         print(traceback.format_exc())
 
-        # Helpful hint when user uses 100% and gets insufficient balance
         msg = str(e)
         if "51008" in msg or "insufficient" in msg.lower():
             return jsonify({
